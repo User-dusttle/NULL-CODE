@@ -2,32 +2,15 @@
 const canvas = document.querySelector("#game");
 const ctx = canvas.getContext("2d");
 
-
+// URL 调试开关：在地址后添加 ?debug=1 可开启无限生命。
 function isDebugMode() {
-  // 支持普通查询参数：?debug=1
-  const searchParams = new URLSearchParams(window.location.search);
-
-  if (searchParams.get("debug") === "1") {
-    return true;
-  }
-
-  // 支持 Hash 路由参数：#/rift/?debug=1
-  const hash = window.location.hash;
+  if (new URLSearchParams(window.location.search).get("debug") === "1") return true;
+  const hash = window.location.hash || "";
   const queryIndex = hash.indexOf("?");
-
-  if (queryIndex === -1) {
-    return false;
-  }
-
-  const hashParams = new URLSearchParams(
-    hash.slice(queryIndex + 1)
-  );
-
-  return hashParams.get("debug") === "1";
+  if (queryIndex < 0) return false;
+  return new URLSearchParams(hash.slice(queryIndex + 1)).get("debug") === "1";
 }
-
 const DEBUG_MODE = isDebugMode();
-
 
 const ui = {
   start: document.querySelector("#start-overlay"),
@@ -2486,4 +2469,3 @@ ui.pauseButton.addEventListener(
 // 启动
 resizeCanvas();
 requestAnimationFrame(frame);
-
