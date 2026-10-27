@@ -80,14 +80,48 @@ function renderRoute(route) {
     renderSubpage(route);
   }
 }
+
 function routeFromHash() {
-  const route = location.hash.replace(/^#\/?/, '') || 'home';
-  const known = ['home','characters','summon','battle','events','inventory','rift','settings'];
-  const safeRoute = known.includes(route) ? route : 'home';
-  if (safeRoute !== route) history.replaceState(null, '', `${location.pathname}${location.search}#/home`);
-  if (safeRoute === 'settings') { renderRoute('home'); showSettings(true); return; }
+  const hash = location.hash;
+  const queryIndex = hash.indexOf("?");
+
+  // 先剥离 Hash 路由内部的查询参数，再解析路由。
+  const path = (
+    queryIndex === -1 ? hash : hash.slice(0, queryIndex)
+  ).replace(/^#\/?/, "").replace(/\/+$/, "");
+
+  const route = path || "home";
+
+  const known = [
+    "home",
+    "characters",
+    "summon",
+    "battle",
+    "events",
+    "inventory",
+    "rift",
+    "settings",
+  ];
+
+  const safeRoute = known.includes(route) ? route : "home";
+
+  if (safeRoute !== route) {
+    history.replaceState(
+      null,
+      "",
+      `${location.pathname}${location.search}#/home`
+    );
+  }
+
+  if (safeRoute === "settings") {
+    renderRoute("home");
+    showSettings(true);
+    return;
+  }
+
   renderRoute(safeRoute);
 }
+
 
 document.addEventListener('click', (event) => {
   const target = event.target.closest('[data-route]');
