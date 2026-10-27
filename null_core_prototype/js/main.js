@@ -82,6 +82,7 @@ const game = {
   particles: [],
   hazards: [],
   minions: [],
+  fuseDrones: [],
 
   nextEnemyShot: 1.2,
   nextMinion: 7,
@@ -207,6 +208,7 @@ function newRun() {
   game.particles = [];
   game.hazards = [];
   game.minions = [];
+  game.fuseDrones = [];
 
   game.nextEnemyShot = 1.2;
   game.nextMinion = 7;
@@ -252,6 +254,13 @@ function newRun() {
 
     airstrikeCooldown: 4.5,
 
+    // FUSE-CORE 专属核心轮转：每 10 秒切换一次，前 5 秒弱点开放。
+    fuseCoreTimer: 0,
+    fuseCoreActive: "fuse",
+    fuseCoreWeakpointOpen: true,
+    fuseCoreShutdown: false,
+    fuseCoreDronesAlive: 10,
+
     // 裂隙猎手专属状态机：hunt -> charge -> dash -> stun
     stalkerState: "hunt",
     stalkerTimer: 3.2,
@@ -281,7 +290,26 @@ function newRun() {
     game.boss.stalkerSideShotTimer = 0;
   }
 
+  if (game.boss.type === "fuse") {
+    game.fuseDrones = Array.from({ length: 10 }, (_, i) => ({
+      index: i,
+      angle: i * Math.PI * 2 / 10,
+      orbitRadius: 72 + (i % 2) * 14,
+      x: game.boss.x,
+      y: game.boss.y,
+      radius: 9,
+      hp: 54,
+      maxHp: 54,
+      alive: true,
+      shootTimer: 1.0 + i * 0.13,
+    }));
+  }
+
   ui.log.replaceChildren();
+  if (game.boss.type === "fuse") {
+    addLog("FUSE-CORE 防御网已启动：10 架无人机在线。");
+    addLog("核心轮转周期 10 秒；弱点仅在每轮前 5 秒开放。");
+  }
 
   addLog("同步链路已建立。");
   addLog("异常体已锁定。保持移动。");
@@ -481,6 +509,11 @@ function updateHUD() {
     } else {
       ui.phaseLabel.textContent = "阶段 03 · 失稳";
     }
+    if (b.type === "fuse") {
+      const coreName = b.fuseCoreShutdown ? "永久停机" : b.fuseCoreActive === "observer" ? "观测核心" : b.fuseCoreActive === "stalker" ? "裂隙核心" : "熔断核心";
+      const status = b.fuseCoreShutdown ? "护盾已解除" : b.fuseCoreWeakpointOpen ? "弱点开放" : "核心封闭";
+      ui.phaseLabel.textContent = `${coreName} · ${status} · 无人机 ${game.fuseDrones.filter(d => d.alive).length}/10`;
+    }
   }
 
   ui.skillStatus.textContent =
@@ -615,6 +648,17 @@ function damageBoss(damage, sourceX, sourceY) {
 
   if (!b || b.transition !== "none") return false;
 
+  if (b.type === "fuse" && !b.fuseCoreShutdown) {
+    if (!b.fuseCoreWeakpointOpen) {
+      if (Math.random() < 0.08) showToast("FUSE-CORE：核心封闭，攻击无效");
+      return false;
+    }
+    // 无人机存活时为核心提供逐层减伤；清空无人机后永久关闭护盾。
+    const alive = game.fuseDrones.filter(d => d.alive).length;
+    const reduction = Math.min(0.82, alive * 0.075);
+    damage *= 1 - reduction;
+  }
+
   b.hp = Math.max(0, b.hp - damage);
   b.hitFlash = 0.1;
 
@@ -731,6 +775,81 @@ function useUltimate() {
   addLog("终结技已释放。");
 
   updateHUD();
+}
+
+
+// ============================================================
+// FUSE-CORE：核心轮转、无人机护盾与无人机攻击
+// ============================================================
+function updateFuseCore(dt) {
+  const b = game.boss;
+  if (!b || b.type !== "fuse" || b.fuseCoreShutdown) return;
+
+  b.fuseCoreTimer += dt;
+  const cycle = b.fuseCoreTimer % 10;
+  const open = cycle < 5;
+  if (open !== b.fuseCoreWeakpointOpen) {
+    b.fuseCoreWeakpointOpen = open;
+    addLog(open ? "核心弱点开放：立即攻击 FUSE-CORE。" : "核心弱点闭合：本轮核心进入无敌状态。 ");
+    showToast(open ? "FUSE-CORE 弱点开放 5 秒" : "核心封闭：转火无人机");
+    if (open) {
+      const cores = ["fuse", "observer", "stalker"];
+      const previous = b.fuseCoreActive;
+      const choices = cores.filter(x => x !== previous);
+      b.fuseCoreActive = choices[Math.floor(Math.random() * choices.length)];
+      const label = b.fuseCoreActive === "observer" ? "OBSERVER-01" : b.fuseCoreActive === "stalker" ? "RIFT-STALKER" : "FUSE-CORE";
+      addLog(`活动核心切换为 ${label}。`);
+    }
+  }
+
+  const aliveDrones = game.fuseDrones.filter(d => d.alive);
+  b.fuseCoreDronesAlive = aliveDrones.length;
+  if (aliveDrones.length === 0 && !b.fuseCoreShutdown) {
+    b.fuseCoreShutdown = true;
+    b.fuseCoreWeakpointOpen = true;
+    b.fuseCoreActive = "fuse";
+    game.enemyBullets = [];
+    emitParticles(b.x, b.y, COLORS.cyan, 70, 230);
+    addLog("10/10 无人机已摧毁。防御网不可逆关闭，FUSE-CORE 护盾解除！");
+    showToast("防御网永久关闭：核心可持续受伤");
+  }
+
+  for (const d of game.fuseDrones) {
+    if (!d.alive) continue;
+    d.angle += dt * (0.55 + (10 - aliveDrones.length) * 0.035);
+    d.x = b.x + Math.cos(d.angle) * d.orbitRadius;
+    d.y = b.y + Math.sin(d.angle) * d.orbitRadius;
+    d.shootTimer -= dt;
+    if (d.shootTimer <= 0 && b.transition === "none") {
+      const p = game.player;
+      if (p) {
+        const a = angleTo(d, p);
+        const speed = 125 + (10 - aliveDrones.length) * 5;
+        game.enemyBullets.push({
+          x: d.x, y: d.y,
+          vx: Math.cos(a) * speed, vy: Math.sin(a) * speed,
+          radius: 3.5, life: 4.5, damage: 4 + Math.floor(aliveDrones.length / 3),
+          color: COLORS.orange,
+        });
+      }
+      d.shootTimer = Math.max(0.65, 2.3 - aliveDrones.length * 0.11);
+    }
+  }
+}
+
+function damageFuseDrone(drone, damage) {
+  if (!drone || !drone.alive) return;
+  drone.hp -= damage;
+  if (drone.hp <= 0) {
+    drone.hp = 0;
+    drone.alive = false;
+    emitParticles(drone.x, drone.y, COLORS.orange, 16, 130);
+    game.ultEnergy = clamp(game.ultEnergy + 5, 0, 100);
+    const left = game.fuseDrones.filter(d => d.alive).length;
+    if (game.boss) game.boss.fuseCoreDronesAlive = left;
+    addLog(`防御无人机被摧毁：剩余 ${left}/10。`);
+    showToast(left === 0 ? "最后一架无人机已摧毁" : `无人机剩余 ${left}/10`);
+  }
 }
 
 // ============================================================
@@ -871,6 +990,25 @@ function spawnEnemyShotPattern() {
 
   // BOSS 03：熔断主机，宽扇形与高密度环形弹幕，后期增加区域轰击。
   if (b.type === "fuse") {
+    const aliveDrones = game.fuseDrones.filter(d => d.alive).length;
+    const droneBoost = Math.min(5, Math.floor(aliveDrones / 2));
+    if (b.fuseCoreActive === "observer" && !b.fuseCoreShutdown) {
+      const count = 10 + droneBoost * 2;
+      for (let i = 0; i < count; i++) {
+        const a = i * Math.PI * 2 / count + b.spin;
+        game.enemyBullets.push({ x: b.x, y: b.y, vx: Math.cos(a) * (145 + aliveDrones * 2), vy: Math.sin(a) * (145 + aliveDrones * 2), radius: 4.2, life: 5.2, damage: 7 + Math.floor(aliveDrones / 4), color: COLORS.violet });
+      }
+      return;
+    }
+    if (b.fuseCoreActive === "stalker" && !b.fuseCoreShutdown) {
+      const count = 5 + droneBoost;
+      for (let i = 0; i < count; i++) {
+        const a = aimed + (i - (count - 1) / 2) * 0.13;
+        const speed = 190 + aliveDrones * 3;
+        game.enemyBullets.push({ x: b.x, y: b.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, radius: 4.5, life: 4.5, damage: 8 + Math.floor(aliveDrones / 4), color: COLORS.pink });
+      }
+      return;
+    }
     if (phase === 1) {
       for (let i = -3; i <= 3; i++) {
         const a = aimed + i * 0.16;
@@ -1611,8 +1749,9 @@ function update(dt) {
 
   b.hitFlash = Math.max(0, b.hitFlash - dt);
 
-  // 更新阶段转换
+  // 更新阶段转换与 FUSE-CORE 专属机制
   updateBossTransition(dt);
+  updateFuseCore(dt);
 
   // 普通攻击计时
   const stalkerCanFire = b.type !== "stalker" || b.phase === 1 || b.stalkerState === "hunt";
@@ -1651,7 +1790,19 @@ function update(dt) {
     if (!bullet.dead) {
       let hitMinion = false;
 
-      for (const m of game.minions) {
+      if (b.type === "fuse") {
+        for (const drone of game.fuseDrones) {
+          if (drone.alive && distance(bullet, drone) < bullet.radius + drone.radius) {
+            bullet.dead = true;
+            damageFuseDrone(drone, bullet.damage);
+            emitParticles(bullet.x, bullet.y, COLORS.orange, 4, 70);
+            hitMinion = true;
+            break;
+          }
+        }
+      }
+
+      if (!hitMinion) for (const m of game.minions) {
         if (
           !m.dead &&
           distance(bullet, m) <
@@ -1968,6 +2119,31 @@ function drawBoss() {
   ctx.save();
   ctx.translate(b.x, b.y);
 
+  if (b.type === "fuse" && !b.fuseCoreShutdown) {
+    ctx.strokeStyle = b.fuseCoreWeakpointOpen ? COLORS.cyan : COLORS.orange;
+    ctx.lineWidth = b.fuseCoreWeakpointOpen ? 3 : 5;
+    ctx.globalAlpha = b.fuseCoreWeakpointOpen ? 0.85 : 0.55;
+    ctx.setLineDash(b.fuseCoreWeakpointOpen ? [] : [6, 5]);
+    ctx.beginPath();
+    ctx.arc(0, 0, 59 + Math.sin(game.elapsed * 5) * 3, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = b.fuseCoreWeakpointOpen ? COLORS.cyan : COLORS.orange;
+    ctx.font = "11px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(b.fuseCoreWeakpointOpen ? "WEAKPOINT OPEN" : "CORE SEALED", 0, -67);
+  } else if (b.type === "fuse" && b.fuseCoreShutdown) {
+    ctx.strokeStyle = COLORS.cyan;
+    ctx.lineWidth = 3;
+    ctx.shadowBlur = 16;
+    ctx.shadowColor = COLORS.cyan;
+    ctx.beginPath();
+    ctx.arc(0, 0, 53 + Math.sin(game.elapsed * 7) * 3, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
   // 大招充能时，绘制粒子环向内汇聚
   if (b.transition === "charge") {
     const progress = 1 - b.transitionTimer / 2.4;
@@ -2084,6 +2260,35 @@ function drawBoss() {
   ctx.fillRect(-5, -5, 10, 10);
 
   ctx.restore();
+}
+
+
+function drawFuseDrones() {
+  if (!game.boss || game.boss.type !== "fuse") return;
+  for (const d of game.fuseDrones) {
+    if (!d.alive) continue;
+    ctx.save();
+    ctx.translate(d.x, d.y);
+    ctx.rotate(d.angle);
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = COLORS.orange;
+    ctx.fillStyle = COLORS.orange;
+    ctx.strokeStyle = "#fff0d8";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(0, -d.radius);
+    ctx.lineTo(d.radius, 0);
+    ctx.lineTo(0, d.radius);
+    ctx.lineTo(-d.radius, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = "rgba(0,0,0,.7)";
+    ctx.fillRect(d.x - 10, d.y - 15, 20, 3);
+    ctx.fillStyle = COLORS.orange;
+    ctx.fillRect(d.x - 10, d.y - 15, 20 * clamp(d.hp / d.maxHp, 0, 1), 3);
+  }
 }
 
 // ============================================================
@@ -2343,6 +2548,7 @@ function render() {
   drawHazards();
   drawBullets();
   drawMinions();
+  drawFuseDrones();
   drawBoss();
   drawPlayer();
   drawParticles();
