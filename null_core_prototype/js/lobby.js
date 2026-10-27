@@ -82,6 +82,8 @@ function renderRoute(route) {
 }
 
 function routeFromHash() {
+   console.log("当前 hash：", location.hash);
+  console.log("当前 search：", location.search);
   const hash = location.hash;
   const queryIndex = hash.indexOf("?");
 
