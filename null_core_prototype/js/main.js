@@ -3,14 +3,7 @@ const canvas = document.querySelector("#game");
 const ctx = canvas.getContext("2d");
 
 // URL 调试开关：在地址后添加 ?debug=1 可开启无限生命。
-function isDebugMode() {
-  if (new URLSearchParams(window.location.search).get("debug") === "1") return true;
-  const hash = window.location.hash || "";
-  const queryIndex = hash.indexOf("?");
-  if (queryIndex < 0) return false;
-  return new URLSearchParams(hash.slice(queryIndex + 1)).get("debug") === "1";
-}
-const DEBUG_MODE = isDebugMode();
+const DEBUG_MODE = new URLSearchParams(window.location.search).get("debug") === "1";
 
 const ui = {
   start: document.querySelector("#start-overlay"),
@@ -82,7 +75,6 @@ const game = {
   particles: [],
   hazards: [],
   minions: [],
-  fuseDrones: [],
 
   nextEnemyShot: 1.2,
   nextMinion: 7,
@@ -254,12 +246,13 @@ function newRun() {
 
     airstrikeCooldown: 4.5,
 
-    // FUSE-CORE 专属核心轮转：每 10 秒切换一次，前 5 秒弱点开放。
-    fuseCoreTimer: 0,
-    fuseCoreActive: "fuse",
-    fuseCoreWeakpointOpen: true,
-    fuseCoreShutdown: false,
-    fuseCoreDronesAlive: 10,
+    // FUSE-CORE 独立机制：阶段一不生成无人机；第三阶段才启动无人机编队。
+    fuseCycleTimer: 0,
+    fuseWeakpointOpen: true,
+    fuseCoreIndex: 0,
+    fuseShutdown: false,
+    fuseDronesSpawned: false,
+    fuseDroneAttackTimer: 1.4,
 
     // 裂隙猎手专属状态机：hunt -> charge -> dash -> stun
     stalkerState: "hunt",
@@ -281,8 +274,17 @@ function newRun() {
     stalkerWarpIndex: 0,
   };
 
+  if (game.boss.type === "fuse") {
+    game.boss.fuseCycleTimer = 0;
+    game.boss.fuseWeakpointOpen = true;
+    game.boss.fuseCoreIndex = 0;
+    game.boss.fuseShutdown = false;
+    game.boss.fuseDronesSpawned = false;
+    addLog("FUSE-CORE 已上线。核心窗口：开放 5 秒，封闭 5 秒。无人机尚未部署。");
+  }
+
   if (game.boss.type === "stalker") {
-    // 阶段一只进行环轨猎杀，不进入冲刺状态机。
+    // 阶段一只进行环轨猎杀，不进入冲刺状态机.
     game.boss.stalkerState = "orbit";
     game.boss.stalkerStateTimer = 0;
     game.boss.stalkerOrbitAngle = -Math.PI / 2;
@@ -290,31 +292,12 @@ function newRun() {
     game.boss.stalkerSideShotTimer = 0;
   }
 
-  if (game.boss.type === "fuse") {
-    game.fuseDrones = Array.from({ length: 10 }, (_, i) => ({
-      index: i,
-      angle: i * Math.PI * 2 / 10,
-      orbitRadius: 72 + (i % 2) * 14,
-      x: game.boss.x,
-      y: game.boss.y,
-      radius: 9,
-      hp: 54,
-      maxHp: 54,
-      alive: true,
-      shootTimer: 1.0 + i * 0.13,
-    }));
-  }
-
   ui.log.replaceChildren();
-  if (game.boss.type === "fuse") {
-    addLog("FUSE-CORE 防御网已启动：10 架无人机在线。");
-    addLog("核心轮转周期 10 秒；弱点仅在每轮前 5 秒开放。");
-  }
 
   addLog("同步链路已建立。");
   addLog("异常体已锁定。保持移动。");
 
-  ui.phaseLabel.textContent = "阶段 01 · 观测";
+  ui.phaseLabel.textContent = game.boss.type === "fuse" ? "阶段 01 · 熔断核心" : "阶段 01 · 观测";
   const bossInfo = game.mode === "rogue" ? ROGUE_BOSSES[game.rogueBossIndex] : ROGUE_BOSSES[0];
   ui.enemyLabel.textContent = bossInfo?.name || "环形观测者";
   const bossTitle = document.querySelector(".right-panel h2");
@@ -502,17 +485,16 @@ function updateHUD() {
 
     // 阶段只由实际战斗状态决定，
     // 不再在 HUD 更新时擅自切换。
-    if (b.phase === 1) {
+    if (b.type === "fuse") {
+      if (b.phase === 1) ui.phaseLabel.textContent = "阶段 01 · 熔断核心";
+      else if (b.phase === 2) ui.phaseLabel.textContent = "阶段 02 · 观测协议残片";
+      else ui.phaseLabel.textContent = "阶段 03 · 裂隙追猎协议";
+    } else if (b.phase === 1) {
       ui.phaseLabel.textContent = "阶段 01 · 观测";
     } else if (b.phase === 2) {
       ui.phaseLabel.textContent = "阶段 02 · 增压";
     } else {
       ui.phaseLabel.textContent = "阶段 03 · 失稳";
-    }
-    if (b.type === "fuse") {
-      const coreName = b.fuseCoreShutdown ? "永久停机" : b.fuseCoreActive === "observer" ? "观测核心" : b.fuseCoreActive === "stalker" ? "裂隙核心" : "熔断核心";
-      const status = b.fuseCoreShutdown ? "护盾已解除" : b.fuseCoreWeakpointOpen ? "弱点开放" : "核心封闭";
-      ui.phaseLabel.textContent = `${coreName} · ${status} · 无人机 ${game.fuseDrones.filter(d => d.alive).length}/10`;
     }
   }
 
@@ -645,36 +627,143 @@ function damageMinion(minion, damage) {
 
 function damageBoss(damage, sourceX, sourceY) {
   const b = game.boss;
-
   if (!b || b.transition !== "none") return false;
 
-  if (b.type === "fuse" && !b.fuseCoreShutdown) {
-    if (!b.fuseCoreWeakpointOpen) {
-      if (Math.random() < 0.08) showToast("FUSE-CORE：核心封闭，攻击无效");
-      return false;
+  let finalDamage = damage;
+  if (b.type === "fuse") {
+    // 熔断主机的核心窗口是独立机制：窗口关闭时不可受伤，除非已永久停机。
+    if (!b.fuseShutdown && !b.fuseWeakpointOpen) return false;
+
+    // 第三阶段的存活无人机为核心提供减伤；全灭后触发不可逆停机。
+    if (b.phase >= 3 && !b.fuseShutdown) {
+      const alive = (game.fuseDrones || []).filter(d => !d.dead && d.hp > 0).length;
+      finalDamage *= 1 - Math.min(0.75, alive * 0.075);
     }
-    // 无人机存活时为核心提供逐层减伤；清空无人机后永久关闭护盾。
-    const alive = game.fuseDrones.filter(d => d.alive).length;
-    const reduction = Math.min(0.82, alive * 0.075);
-    damage *= 1 - reduction;
   }
 
-  b.hp = Math.max(0, b.hp - damage);
+  b.hp = Math.max(0, b.hp - finalDamage);
   b.hitFlash = 0.1;
-
   game.ultEnergy = clamp(game.ultEnergy + 4, 0, 100);
-
   if (sourceX !== undefined && sourceY !== undefined) {
-    emitParticles(
-      sourceX,
-      sourceY,
-      COLORS.cyan,
-      3,
-      60
-    );
+    emitParticles(sourceX, sourceY, COLORS.cyan, 3, 60);
+  }
+  return true;
+}
+
+function damageFuseDrone(drone, damage) {
+  if (!drone || drone.dead || game.boss?.type !== "fuse" || game.boss.phase < 3) return;
+  drone.hp = Math.max(0, drone.hp - damage);
+  if (drone.hp > 0) return;
+
+  drone.dead = true;
+  emitParticles(drone.x, drone.y, COLORS.orange, 12, 115);
+  game.ultEnergy = clamp(game.ultEnergy + 5, 0, 100);
+  const alive = (game.fuseDrones || []).filter(d => !d.dead && d.hp > 0).length;
+  addLog(`FUSE-CORE 无人机已摧毁：剩余 ${alive}/10。`);
+
+  if (alive === 0 && !game.boss.fuseShutdown) {
+    game.boss.fuseShutdown = true;
+    game.boss.fuseWeakpointOpen = true;
+    game.enemyBullets = [];
+    emitParticles(game.boss.x, game.boss.y, COLORS.cyan, 48, 230);
+    addLog("无人机编队全灭。FUSE-CORE 永久停机，核心护盾已解除。");
+    showToast("核心护盾解除：永久暴露");
+  }
+}
+
+function spawnFuseDrones() {
+  const b = game.boss;
+  if (!b || b.type !== "fuse" || b.fuseDronesSpawned) return;
+  b.fuseDronesSpawned = true;
+  game.fuseDrones = [];
+  for (let i = 0; i < 10; i++) {
+    game.fuseDrones.push({
+      id: i,
+      angle: Math.PI * 2 * i / 10,
+      orbitRadius: 78 + (i % 2) * 18,
+      radius: 9,
+      hp: 90,
+      maxHp: 90,
+      x: b.x,
+      y: b.y,
+      shootTimer: 1.8 + i * 0.11,
+      dead: false,
+    });
+  }
+  addLog("阶段 03：裂隙追猎协议启动。10 架护卫无人机部署。");
+  showToast("阶段 03：无人机编队已部署");
+}
+
+function updateFuseMechanics(dt) {
+  const b = game.boss;
+  if (!b || b.type !== "fuse") return;
+
+  // 核心窗口每 10 秒循环：前 5 秒开放，后 5 秒封闭。
+  if (!b.fuseShutdown) {
+    b.fuseCycleTimer += dt;
+    if (b.fuseCycleTimer >= 10) {
+      b.fuseCycleTimer -= 10;
+      b.fuseCoreIndex = (b.fuseCoreIndex + 1) % 3;
+      addLog(`核心切换至节点 ${b.fuseCoreIndex + 1}。`);
+    }
+    const open = b.fuseCycleTimer < 5;
+    if (open !== b.fuseWeakpointOpen) {
+      b.fuseWeakpointOpen = open;
+      addLog(open ? "核心弱点窗口开启：现在可以造成伤害。" : "核心护盾闭合：等待下一轮窗口或摧毁全部无人机。");
+      showToast(open ? "核心弱点开放" : "核心护盾闭合");
+    }
   }
 
-  return true;
+  if (b.phase >= 3 && b.fuseDronesSpawned) {
+    const alive = (game.fuseDrones || []).filter(d => !d.dead && d.hp > 0);
+    for (const d of alive) {
+      d.angle += dt * (0.8 + d.id * 0.012);
+      const targetX = b.x + Math.cos(d.angle) * d.orbitRadius;
+      const targetY = b.y + Math.sin(d.angle) * d.orbitRadius * 0.72;
+      d.x += (targetX - d.x) * Math.min(1, dt * 5);
+      d.y += (targetY - d.y) * Math.min(1, dt * 5);
+      d.shootTimer -= dt;
+      if (d.shootTimer <= 0) {
+        const p = game.player;
+        if (p) {
+          const a = angleTo(d, p);
+          const speed = 125 + (10 - alive.length) * 4;
+          game.enemyBullets.push({ x:d.x, y:d.y, vx:Math.cos(a)*speed, vy:Math.sin(a)*speed, radius:3.6, life:4.2, damage:5 + (10 - alive.length) * 0.25, color:COLORS.orange });
+        }
+        d.shootTimer = Math.max(0.75, 2.3 - (10 - alive.length) * 0.08);
+      }
+    }
+  }
+}
+
+function updateFuseTransition() {
+  const b = game.boss;
+  if (!b || b.type !== "fuse" || b.transition !== "none") return;
+
+  if (b.phase === 1 && b.hp <= b.maxHp * 0.65) {
+    b.phase = 2;
+    b.fuseCycleTimer = 0;
+    b.fuseWeakpointOpen = true;
+    b.attackTimer = 0;
+    game.enemyBullets = [];
+    game.nextEnemyShot = game.elapsed + 0.55;
+    ui.phaseLabel.textContent = "阶段 02 · 观测协议残片";
+    addLog("FUSE-CORE 载入观测者残片。环形弹幕协议已启用；无人机仍未部署。");
+    showToast("阶段 02：观测协议残片");
+    emitParticles(b.x, b.y, COLORS.violet, 32, 180);
+  } else if (b.phase === 2 && b.hp <= b.maxHp * 0.30) {
+    b.phase = 3;
+    b.fuseCycleTimer = 0;
+    b.fuseWeakpointOpen = true;
+    b.attackTimer = 0;
+    game.enemyBullets = [];
+    game.nextEnemyShot = game.elapsed + 0.45;
+    ui.phaseLabel.textContent = "阶段 03 · 裂隙追猎协议";
+    addLog("FUSE-CORE 载入裂隙追猎者残片。核心进入过载，无人机编队现在才会部署。");
+    spawnFuseDrones();
+    showToast("阶段 03：裂隙追猎协议");
+    emitParticles(b.x, b.y, COLORS.pink, 40, 210);
+  }
 }
 
 function useSkill() {
@@ -777,81 +866,6 @@ function useUltimate() {
   updateHUD();
 }
 
-
-// ============================================================
-// FUSE-CORE：核心轮转、无人机护盾与无人机攻击
-// ============================================================
-function updateFuseCore(dt) {
-  const b = game.boss;
-  if (!b || b.type !== "fuse" || b.fuseCoreShutdown) return;
-
-  b.fuseCoreTimer += dt;
-  const cycle = b.fuseCoreTimer % 10;
-  const open = cycle < 5;
-  if (open !== b.fuseCoreWeakpointOpen) {
-    b.fuseCoreWeakpointOpen = open;
-    addLog(open ? "核心弱点开放：立即攻击 FUSE-CORE。" : "核心弱点闭合：本轮核心进入无敌状态。 ");
-    showToast(open ? "FUSE-CORE 弱点开放 5 秒" : "核心封闭：转火无人机");
-    if (open) {
-      const cores = ["fuse", "observer", "stalker"];
-      const previous = b.fuseCoreActive;
-      const choices = cores.filter(x => x !== previous);
-      b.fuseCoreActive = choices[Math.floor(Math.random() * choices.length)];
-      const label = b.fuseCoreActive === "observer" ? "OBSERVER-01" : b.fuseCoreActive === "stalker" ? "RIFT-STALKER" : "FUSE-CORE";
-      addLog(`活动核心切换为 ${label}。`);
-    }
-  }
-
-  const aliveDrones = game.fuseDrones.filter(d => d.alive);
-  b.fuseCoreDronesAlive = aliveDrones.length;
-  if (aliveDrones.length === 0 && !b.fuseCoreShutdown) {
-    b.fuseCoreShutdown = true;
-    b.fuseCoreWeakpointOpen = true;
-    b.fuseCoreActive = "fuse";
-    game.enemyBullets = [];
-    emitParticles(b.x, b.y, COLORS.cyan, 70, 230);
-    addLog("10/10 无人机已摧毁。防御网不可逆关闭，FUSE-CORE 护盾解除！");
-    showToast("防御网永久关闭：核心可持续受伤");
-  }
-
-  for (const d of game.fuseDrones) {
-    if (!d.alive) continue;
-    d.angle += dt * (0.55 + (10 - aliveDrones.length) * 0.035);
-    d.x = b.x + Math.cos(d.angle) * d.orbitRadius;
-    d.y = b.y + Math.sin(d.angle) * d.orbitRadius;
-    d.shootTimer -= dt;
-    if (d.shootTimer <= 0 && b.transition === "none") {
-      const p = game.player;
-      if (p) {
-        const a = angleTo(d, p);
-        const speed = 125 + (10 - aliveDrones.length) * 5;
-        game.enemyBullets.push({
-          x: d.x, y: d.y,
-          vx: Math.cos(a) * speed, vy: Math.sin(a) * speed,
-          radius: 3.5, life: 4.5, damage: 4 + Math.floor(aliveDrones.length / 3),
-          color: COLORS.orange,
-        });
-      }
-      d.shootTimer = Math.max(0.65, 2.3 - aliveDrones.length * 0.11);
-    }
-  }
-}
-
-function damageFuseDrone(drone, damage) {
-  if (!drone || !drone.alive) return;
-  drone.hp -= damage;
-  if (drone.hp <= 0) {
-    drone.hp = 0;
-    drone.alive = false;
-    emitParticles(drone.x, drone.y, COLORS.orange, 16, 130);
-    game.ultEnergy = clamp(game.ultEnergy + 5, 0, 100);
-    const left = game.fuseDrones.filter(d => d.alive).length;
-    if (game.boss) game.boss.fuseCoreDronesAlive = left;
-    addLog(`防御无人机被摧毁：剩余 ${left}/10。`);
-    showToast(left === 0 ? "最后一架无人机已摧毁" : `无人机剩余 ${left}/10`);
-  }
-}
-
 // ============================================================
 // 小怪
 // ============================================================
@@ -895,6 +909,7 @@ function updateMinions(dt) {
   const p = game.player;
 
   if (
+    b.type !== "fuse" &&
     b.phase === 1 &&
     b.transition === "none"
   ) {
@@ -988,43 +1003,35 @@ function spawnEnemyShotPattern() {
     return;
   }
 
-  // BOSS 03：熔断主机，宽扇形与高密度环形弹幕，后期增加区域轰击。
+  // FUSE-CORE 三阶段攻击：熔断炮列 -> 观测协议残片 -> 裂隙追猎协议。
   if (b.type === "fuse") {
-    const aliveDrones = game.fuseDrones.filter(d => d.alive).length;
-    const droneBoost = Math.min(5, Math.floor(aliveDrones / 2));
-    if (b.fuseCoreActive === "observer" && !b.fuseCoreShutdown) {
-      const count = 10 + droneBoost * 2;
-      for (let i = 0; i < count; i++) {
-        const a = i * Math.PI * 2 / count + b.spin;
-        game.enemyBullets.push({ x: b.x, y: b.y, vx: Math.cos(a) * (145 + aliveDrones * 2), vy: Math.sin(a) * (145 + aliveDrones * 2), radius: 4.2, life: 5.2, damage: 7 + Math.floor(aliveDrones / 4), color: COLORS.violet });
-      }
-      return;
-    }
-    if (b.fuseCoreActive === "stalker" && !b.fuseCoreShutdown) {
-      const count = 5 + droneBoost;
-      for (let i = 0; i < count; i++) {
-        const a = aimed + (i - (count - 1) / 2) * 0.13;
-        const speed = 190 + aliveDrones * 3;
-        game.enemyBullets.push({ x: b.x, y: b.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, radius: 4.5, life: 4.5, damage: 8 + Math.floor(aliveDrones / 4), color: COLORS.pink });
-      }
-      return;
-    }
     if (phase === 1) {
+      // 熔断炮列：短促宽扇形，不复制观测者的旋转环。
       for (let i = -3; i <= 3; i++) {
-        const a = aimed + i * 0.16;
-        game.enemyBullets.push({ x: b.x, y: b.y + 14, vx: Math.cos(a) * 150, vy: Math.sin(a) * 150, radius: 5, life: 5, damage: 10, color: COLORS.orange });
+        const a = aimed + i * 0.17;
+        const speed = 145 + Math.abs(i) * 8;
+        game.enemyBullets.push({ x:b.x, y:b.y+14, vx:Math.cos(a)*speed, vy:Math.sin(a)*speed, radius:5, life:5, damage:9, color:COLORS.orange });
       }
     } else if (phase === 2) {
+      // 弱化观测者：有安全缺口的慢速环，缺口朝向玩家。
       const gap = aimed + Math.PI;
-      for (let i = 0; i < 16; i++) {
-        const a = i * Math.PI * 2 / 16 + b.spin;
-        if (Math.abs(angleDiff(a, gap)) < 0.28) continue;
-        game.enemyBullets.push({ x: b.x, y: b.y, vx: Math.cos(a) * 165, vy: Math.sin(a) * 165, radius: 4.5, life: 5.5, damage: 9, color: COLORS.orange });
+      for (let i = 0; i < 14; i++) {
+        const a = i * Math.PI * 2 / 14 + b.spin;
+        if (Math.abs(angleDiff(a, gap)) < 0.38) continue;
+        game.enemyBullets.push({ x:b.x, y:b.y, vx:Math.cos(a)*142, vy:Math.sin(a)*142, radius:4.2, life:5.8, damage:8, color:COLORS.violet });
       }
     } else {
-      for (let i = 0; i < 20; i++) {
-        const a = i * Math.PI * 2 / 20 + b.spin * 1.2;
-        game.enemyBullets.push({ x: b.x, y: b.y, vx: Math.cos(a) * (160 + (i % 2) * 55), vy: Math.sin(a) * (160 + (i % 2) * 55), radius: 4.5, life: 5.5, damage: 10, color: i % 2 ? COLORS.orange : COLORS.pink });
+      // 弱化裂隙追猎者：瞄准扇形 + 少量交叉弹，不启用完整猎手冲刺状态机。
+      for (let i = -2; i <= 2; i++) {
+        const a = aimed + i * 0.14;
+        const speed = 210 + (10 - (game.fuseDrones || []).filter(d=>!d.dead && d.hp>0).length) * 3;
+        game.enemyBullets.push({ x:b.x, y:b.y, vx:Math.cos(a)*speed, vy:Math.sin(a)*speed, radius:4.6, life:4.5, damage:9, color:COLORS.pink });
+      }
+      if (Math.random() < 0.55) {
+        for (const offset of [-0.32, 0.32]) {
+          const a = aimed + offset + Math.PI / 2;
+          game.enemyBullets.push({ x:b.x, y:b.y, vx:Math.cos(a)*155, vy:Math.sin(a)*155, radius:3.8, life:4.5, damage:7, color:COLORS.cyan });
+        }
       }
     }
     return;
@@ -1526,6 +1533,12 @@ function updateStalkerTransition(dt) {
 function updateBossTransition(dt) {
   const b = game.boss;
 
+  // FUSE-CORE 使用自己的三阶段转换，不套用观测者终极充能状态机。
+  if (b.type === "fuse") {
+    updateFuseTransition();
+    return;
+  }
+
   // 裂隙猎手有独立阶段转场，不套用观测者的终极螺旋。
   if (b.type === "stalker") {
     updateStalkerTransition(dt);
@@ -1734,24 +1747,20 @@ function update(dt) {
 
   if (b.type === "stalker") {
     if (b.transition === "none") updateStalkerMovement(dt);
+  } else if (b.type === "fuse") {
+    const amp = b.phase === 1 ? 0.12 : b.phase === 2 ? 0.16 : 0.21;
+    b.x = game.width * 0.5 + Math.sin(b.moveTime * (b.phase === 3 ? 1.05 : 0.58)) * game.width * amp;
+    b.y = Math.max(76, game.height * 0.2 + Math.sin(b.moveTime * 0.85) * (b.phase === 3 ? 28 : 14));
   } else {
-    b.x =
-      game.width * 0.5 +
-      Math.sin(b.moveTime * 0.62 * speedMultiplier) *
-        game.width * 0.19;
-
-    b.y = Math.max(
-      74,
-      game.height * 0.18 +
-        Math.sin(b.moveTime * 0.9 * speedMultiplier) * 16
-    );
+    b.x = game.width * 0.5 + Math.sin(b.moveTime * 0.62 * speedMultiplier) * game.width * 0.19;
+    b.y = Math.max(74, game.height * 0.18 + Math.sin(b.moveTime * 0.9 * speedMultiplier) * 16);
   }
 
   b.hitFlash = Math.max(0, b.hitFlash - dt);
 
-  // 更新阶段转换与 FUSE-CORE 专属机制
+  // 更新阶段转换；FUSE-CORE 核心循环和无人机只在其专属阶段运行。
   updateBossTransition(dt);
-  updateFuseCore(dt);
+  if (b.type === "fuse") updateFuseMechanics(dt);
 
   // 普通攻击计时
   const stalkerCanFire = b.type !== "stalker" || b.phase === 1 || b.stalkerState === "hunt";
@@ -1790,19 +1799,20 @@ function update(dt) {
     if (!bullet.dead) {
       let hitMinion = false;
 
-      if (b.type === "fuse") {
-        for (const drone of game.fuseDrones) {
-          if (drone.alive && distance(bullet, drone) < bullet.radius + drone.radius) {
+      // 无人机只会在 FUSE-CORE 第三阶段出现，且一发子弹只命中一个目标。
+      if (b.type === "fuse" && b.phase >= 3 && b.fuseDronesSpawned) {
+        for (const d of (game.fuseDrones || [])) {
+          if (!d.dead && distance(bullet, d) < bullet.radius + d.radius) {
             bullet.dead = true;
-            damageFuseDrone(drone, bullet.damage);
-            emitParticles(bullet.x, bullet.y, COLORS.orange, 4, 70);
+            damageFuseDrone(d, bullet.damage);
+            emitParticles(bullet.x, bullet.y, COLORS.cyan, 3, 60);
             hitMinion = true;
             break;
           }
         }
       }
 
-      if (!hitMinion) for (const m of game.minions) {
+      for (const m of (hitMinion ? [] : game.minions)) {
         if (
           !m.dead &&
           distance(bullet, m) <
@@ -2108,6 +2118,31 @@ function drawPlayer() {
 }
 
 // ============================================================
+// 绘制 FUSE-CORE 无人机（只在第三阶段绘制）
+// ============================================================
+
+function drawFuseDrones() {
+  const b = game.boss;
+  if (!b || b.type !== "fuse" || b.phase < 3 || !b.fuseDronesSpawned) return;
+  for (const d of (game.fuseDrones || [])) {
+    if (d.dead || d.hp <= 0) continue;
+    ctx.save();
+    ctx.translate(d.x, d.y);
+    ctx.rotate(d.angle + Math.PI / 4);
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = COLORS.orange;
+    ctx.fillStyle = COLORS.orange;
+    ctx.fillRect(-d.radius * 0.72, -d.radius * 0.72, d.radius * 1.44, d.radius * 1.44);
+    ctx.restore();
+    const w = 22, ratio = clamp(d.hp / d.maxHp, 0, 1);
+    ctx.fillStyle = "rgba(0,0,0,.7)";
+    ctx.fillRect(d.x - w/2, d.y - 17, w, 3);
+    ctx.fillStyle = COLORS.orange;
+    ctx.fillRect(d.x - w/2, d.y - 17, w * ratio, 3);
+  }
+}
+
+// ============================================================
 // 绘制 BOSS
 // ============================================================
 
@@ -2118,31 +2153,6 @@ function drawBoss() {
 
   ctx.save();
   ctx.translate(b.x, b.y);
-
-  if (b.type === "fuse" && !b.fuseCoreShutdown) {
-    ctx.strokeStyle = b.fuseCoreWeakpointOpen ? COLORS.cyan : COLORS.orange;
-    ctx.lineWidth = b.fuseCoreWeakpointOpen ? 3 : 5;
-    ctx.globalAlpha = b.fuseCoreWeakpointOpen ? 0.85 : 0.55;
-    ctx.setLineDash(b.fuseCoreWeakpointOpen ? [] : [6, 5]);
-    ctx.beginPath();
-    ctx.arc(0, 0, 59 + Math.sin(game.elapsed * 5) * 3, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = b.fuseCoreWeakpointOpen ? COLORS.cyan : COLORS.orange;
-    ctx.font = "11px monospace";
-    ctx.textAlign = "center";
-    ctx.fillText(b.fuseCoreWeakpointOpen ? "WEAKPOINT OPEN" : "CORE SEALED", 0, -67);
-  } else if (b.type === "fuse" && b.fuseCoreShutdown) {
-    ctx.strokeStyle = COLORS.cyan;
-    ctx.lineWidth = 3;
-    ctx.shadowBlur = 16;
-    ctx.shadowColor = COLORS.cyan;
-    ctx.beginPath();
-    ctx.arc(0, 0, 53 + Math.sin(game.elapsed * 7) * 3, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-  }
 
   // 大招充能时，绘制粒子环向内汇聚
   if (b.transition === "charge") {
@@ -2219,6 +2229,26 @@ function drawBoss() {
     ctx.setLineDash([]);
   }
 
+  if (b.type === "fuse") {
+    // 外环表示护盾状态；三角节点表示当前轮换核心。
+    ctx.save();
+    ctx.strokeStyle = b.fuseShutdown ? COLORS.cyan : (b.fuseWeakpointOpen ? COLORS.orange : "rgba(255,180,110,.28)");
+    ctx.lineWidth = b.fuseShutdown ? 4 : 2.5;
+    ctx.shadowBlur = b.fuseWeakpointOpen || b.fuseShutdown ? 18 : 4;
+    ctx.shadowColor = b.fuseShutdown ? COLORS.cyan : COLORS.orange;
+    ctx.beginPath();
+    ctx.arc(0, 0, b.fuseWeakpointOpen || b.fuseShutdown ? 56 : 49, 0, Math.PI * 2);
+    ctx.stroke();
+    for (let i = 0; i < 3; i++) {
+      const a = i * Math.PI * 2 / 3 - Math.PI / 2;
+      ctx.fillStyle = (i === b.fuseCoreIndex && b.fuseWeakpointOpen && !b.fuseShutdown) || b.fuseShutdown ? COLORS.cyan : "rgba(255,180,110,.3)";
+      ctx.beginPath();
+      ctx.arc(Math.cos(a) * 46, Math.sin(a) * 46, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
   const bossColor = b.type === "stalker" ? COLORS.cyan : b.type === "fuse" ? COLORS.orange : COLORS.violet;
   ctx.rotate(b.spin * 0.35);
 
@@ -2260,35 +2290,6 @@ function drawBoss() {
   ctx.fillRect(-5, -5, 10, 10);
 
   ctx.restore();
-}
-
-
-function drawFuseDrones() {
-  if (!game.boss || game.boss.type !== "fuse") return;
-  for (const d of game.fuseDrones) {
-    if (!d.alive) continue;
-    ctx.save();
-    ctx.translate(d.x, d.y);
-    ctx.rotate(d.angle);
-    ctx.shadowBlur = 12;
-    ctx.shadowColor = COLORS.orange;
-    ctx.fillStyle = COLORS.orange;
-    ctx.strokeStyle = "#fff0d8";
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(0, -d.radius);
-    ctx.lineTo(d.radius, 0);
-    ctx.lineTo(0, d.radius);
-    ctx.lineTo(-d.radius, 0);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-    ctx.fillStyle = "rgba(0,0,0,.7)";
-    ctx.fillRect(d.x - 10, d.y - 15, 20, 3);
-    ctx.fillStyle = COLORS.orange;
-    ctx.fillRect(d.x - 10, d.y - 15, 20 * clamp(d.hp / d.maxHp, 0, 1), 3);
-  }
 }
 
 // ============================================================
